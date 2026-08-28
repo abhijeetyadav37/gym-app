@@ -5,8 +5,11 @@ import MembershipStatusCard from "../../components/MembershipStatusCard";
 import NotificationsPanel from "../../components/NotificationsPanel";
 import ExerciseWeekView from "../../components/ExerciseWeekView";
 import MyAttendanceCard from "../../components/MyAttendanceCard";
+import { useAuth } from "../../context/AuthContext";
+import MyAbsenceBoard from "../../components/MyAbsenceBoard";
 
 function MemberDashboard() {
+  const { currentUser } = useAuth();
   const [membership, setMembership] = useState(null);
   const [exerciseSchedule, setExerciseSchedule] = useState([]);
   const [notifications, setNotifications] = useState([]);
@@ -77,14 +80,18 @@ function MemberDashboard() {
         />
 
         <div className="grid md:grid-cols-2 gap-6 mb-6">
-          <MembershipStatusCard membership={membership} />
-          <ExerciseWeekView exerciseSchedule={exerciseSchedule} />
-        </div>
+  <MembershipStatusCard membership={membership} />
+  <ExerciseWeekView exerciseSchedule={exerciseSchedule} />
+</div>
 
-        <MyAttendanceCard
-          currentStreak={attendanceData.current_streak}
-          summaryData={attendanceData.summary}
-        />
+<div className="mb-6">
+  <MyAbsenceBoard summaryData={attendanceData.summary} accountCreatedAt={currentUser?.created_at} />
+</div>
+
+<MyAttendanceCard
+  currentStreak={attendanceData.current_streak}
+  summaryData={attendanceData.summary}
+/>
       </main>
     </div>
   );
