@@ -53,7 +53,7 @@ func (h *AdminHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 				ORDER BY created_at DESC
 				LIMIT 1
 			)
-		WHERE u.role = 'member'
+		WHERE u.role = 'member' AND u.is_active = TRUE
 	`
 
 	args := []interface{}{}
@@ -284,43 +284,27 @@ func (h *AdminHandler) SetMembership(w http.ResponseWriter, r *http.Request) {
 }
 
 // RemoveMember deletes a member entirely.
+// RemoveMember no longer deletes the row — it flips is_active to
+// false. Their attendance history, membership records, and workout
+// plans stay intact forever (so old print sheets still show their
+// name), but they disappear from active member lists and can no
+// longer log in.
 func (h *AdminHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	memberID := chi.URLParam(r, "id")
 
-	result, err := database.DB.Exec(
-		context.Background(),
-		`
-		DELETE FROM users
-		WHERE id = $1 AND role = 'member'
-		`,
-		memberID,
-	)
+	result, err := database.DB.Exec(context.Background(),
+		`UPDATE users SET is_active = FALSE WHERE id = $1 AND role = 'member'`, memberID)
 
 	if err != nil {
-		http.Error(
-			w,
-			"Could not remove member",
-			http.StatusInternalServerError,
-		)
+		http.Error(w, "Could not remove member", http.StatusInternalServerError)
 		return
 	}
-
 	if result.RowsAffected() == 0 {
-		http.Error(
-			w,
-			"Member not found",
-			http.StatusNotFound,
-		)
+		http.Error(w, "Member not found", http.StatusNotFound)
 		return
 	}
 
-	respondJSON(
-		w,
-		http.StatusOK,
-		map[string]string{
-			"message": "Member removed",
-		},
-	)
+	respondJSON(w, http.StatusOK, map[string]string{"message": "Member removed"})
 }
 
 // ListBatches returns all batches.
