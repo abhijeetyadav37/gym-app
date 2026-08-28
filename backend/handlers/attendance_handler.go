@@ -152,7 +152,7 @@ func (h *AttendanceHandler) AttendanceSummary(w http.ResponseWriter, r *http.Req
 	rows, err := database.DB.Query(context.Background(), `
 		SELECT attendance_date, COUNT(*)
 		FROM attendance
-		WHERE attendance_date >= CURRENT_DATE - ($1 || ' days')::INTERVAL
+		WHERE attendance_date >= CURRENT_DATE - ($1 * INTERVAL '1 day')
 		GROUP BY attendance_date
 		ORDER BY attendance_date ASC
 	`, days)

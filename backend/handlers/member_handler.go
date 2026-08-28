@@ -7,6 +7,7 @@ import (
 	"backend/database"
 	appMiddleware "backend/middleware"
 	"backend/models"
+	"log"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -51,9 +52,10 @@ func (h *MemberHandler) MyNotifications(w http.ResponseWriter, r *http.Request) 
 	`, userID)
 
 	if err != nil {
-		http.Error(w, "Could not fetch notifications", http.StatusInternalServerError)
-		return
-	}
+	log.Println("Could not fetch notifications:", err)
+	http.Error(w, "Could not fetch notifications", http.StatusInternalServerError)
+	return
+}
 	defer rows.Close()
 
 	notifs := []models.Notification{}
