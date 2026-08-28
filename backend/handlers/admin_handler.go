@@ -53,7 +53,7 @@ func (h *AdminHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 				ORDER BY created_at DESC
 				LIMIT 1
 			)
-		WHERE u.role = 'member' AND u.is_active = TRUE
+		WHERE u.role = 'member'  AND u.is_active = TRUE
 	`
 
 	args := []interface{}{}
@@ -284,11 +284,6 @@ func (h *AdminHandler) SetMembership(w http.ResponseWriter, r *http.Request) {
 }
 
 // RemoveMember deletes a member entirely.
-// RemoveMember no longer deletes the row — it flips is_active to
-// false. Their attendance history, membership records, and workout
-// plans stay intact forever (so old print sheets still show their
-// name), but they disappear from active member lists and can no
-// longer log in.
 func (h *AdminHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	memberID := chi.URLParam(r, "id")
 

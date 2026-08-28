@@ -2,48 +2,145 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
-	"strconv"
-	"time"
-
+	"log"
+	"backend/auth"
 	"backend/database"
+	"backend/email"
+	appMiddleware "backend/middleware"
 	"backend/models"
+	
 
-	"github.com/go-chi/chi/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
-type AttendanceHandler struct{}
-
-func NewAttendanceHandler() *AttendanceHandler {
-	return &AttendanceHandler{}
+// AuthHandler bundles the JWT secret so it's available to every
+// handler function without using a global variable.
+type AuthHandler struct {
+	JWTSecret   string
+	FrontendURL string
 }
 
-// daysBetween returns how many calendar days apart two dates are,
-// ignoring the time-of-day portion.
-func daysBetween(earlier, later time.Time) int {
-	e := time.Date(
-		earlier.Year(),
-		earlier.Month(),
-		earlier.Day(),
-		0, 0, 0, 0,
-		time.UTC,
-	)
-
-	l := time.Date(
-		later.Year(),
-		later.Month(),
-		later.Day(),
-		0, 0, 0, 0,
-		time.UTC,
-	)
-
-	return int(l.Sub(e).Hours() / 24)
+func NewAuthHandler(jwtSecret string, frontendURL string) *AuthHandler {
+	return &AuthHandler{JWTSecret: jwtSecret, FrontendURL: frontendURL}
 }
 
-func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Request) {
-	var req models.MarkAttendanceRequest
+func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
+	var req models.SignupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
 
+	if req.Name == "" || req.Email == "" || req.Password == "" || req.Otp == "" {
+		http.Error(w, "Name, email, password, and verification code are all required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+
+	var matchingOtpID int
+	err := database.DB.QueryRow(ctx, `
+		SELECT id FROM signup_otps
+		WHERE email = $1 AND otp_code = $2 AND used = FALSE AND expires_at > NOW()
+		ORDER BY created_at DESC LIMIT 1
+	`, req.Email, req.Otp).Scan(&matchingOtpID)
+
+	if err != nil {
+		http.Error(w, "Invalid or expired verification code", http.StatusBadRequest)
+		return
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Could not process password", http.StatusInternalServerError)
+		return
+	}
+
+	var newUser models.User
+	err = database.DB.QueryRow(ctx,
+		`INSERT INTO users (name, email, password_hash, role)
+		 VALUES ($1, $2, $3, 'member')
+		 RETURNING id, name, email, role, created_at`,
+		req.Name, req.Email, string(hashedPassword),
+	).Scan(&newUser.ID, &newUser.Name, &newUser.Email, &newUser.Role, &newUser.CreatedAt)
+
+	if err != nil {
+		if isDuplicateEmailError(err) {
+			http.Error(w, "This email is already registered. Please log in instead.", http.StatusConflict)
+			return
+		}
+		http.Error(w, "Could not create account", http.StatusInternalServerError)
+		return
+	}
+
+	database.DB.Exec(ctx, `UPDATE signup_otps SET used = TRUE WHERE id = $1`, matchingOtpID)
+
+	token, err := auth.GenerateToken(newUser.ID, newUser.Role, h.JWTSecret)
+	if err != nil {
+		http.Error(w, "Could not generate session", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, models.AuthResponse{Token: token, User: newUser})
+}
+
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	var user models.User
+var isActive bool
+err := database.DB.QueryRow(context.Background(),
+	`SELECT id, name, email, password_hash, role, created_at, is_active
+	 FROM users WHERE email = $1`,
+	req.Email,
+).Scan(&user.ID, &user.Name, &user.Email, &user.PasswordHash, &user.Role, &user.CreatedAt, &isActive)
+
+if err != nil {
+	// Deliberately vague — don't reveal whether the email exists or not.
+	http.Error(w, "Invalid email or password", http.StatusUnauthorized)
+	return
+}
+
+if !isActive {
+	http.Error(w, "This account has been deactivated. Please contact the gym.", http.StatusForbidden)
+	return
+}
+}
+
+func isDuplicateEmailError(err error) bool {
+	return err != nil && (containsPgCode(err, "23505"))
+}
+
+// Me returns the currently logged-in user's basic info.
+// It's protected by RequireAuth middleware, so r.Context() will
+// always have a user_id by the time we get here.
+func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(appMiddleware.UserIDKey).(int)
+
+	var user models.User
+	err := database.DB.QueryRow(context.Background(),
+		`SELECT id, name, email, role, created_at FROM users WHERE id = $1`,
+		userID,
+	).Scan(&user.ID, &user.Name, &user.Email, &user.Role, &user.CreatedAt)
+
+	if err != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, user)
+}
+
+
+// ForgotPassword always returns the same success message whether or
+// not the email exists — this prevents someone from using this
+// endpoint to discover which emails are registered.
+func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
+	var req models.ForgotPasswordRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
@@ -51,353 +148,116 @@ func (h *AttendanceHandler) MarkAttendance(w http.ResponseWriter, r *http.Reques
 
 	ctx := context.Background()
 
-	var todayFromDB time.Time
+	var userID int
+	err := database.DB.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, req.Email).Scan(&userID)
 
-	if err := database.DB.QueryRow(ctx, `SELECT CURRENT_DATE`).Scan(&todayFromDB); err != nil {
-		http.Error(w, "Could not determine current date", http.StatusInternalServerError)
-		return
+	if err == nil {
+		tokenBytes := make([]byte, 32)
+		rand.Read(tokenBytes)
+		token := hex.EncodeToString(tokenBytes)
+
+		database.DB.Exec(ctx, `
+			INSERT INTO password_reset_tokens (user_id, token, expires_at)
+			VALUES ($1, $2, NOW() + INTERVAL '30 minutes')
+		`, userID, token)
+
+		resetLink := fmt.Sprintf("%s/reset-password?token=%s", h.FrontendURL, token)
+
+		// Sent in a goroutine so a slow email provider never delays
+		// the HTTP response back to the user.
+		go func() {
+	if err := email.SendPasswordResetEmail(req.Email, resetLink); err != nil {
+		log.Println("Failed to send password reset email:", err)
+	}
+}()
 	}
 
-	todayDateString := todayFromDB.Format("2006-01-02")
-
-	var currentStreak int
-	var lastAttendanceDate *time.Time
-
-	err := database.DB.QueryRow(
-		ctx,
-		`SELECT current_streak, last_attendance_date FROM users WHERE id = $1`,
-		req.UserID,
-	).Scan(&currentStreak, &lastAttendanceDate)
-
-	if err != nil {
-		http.Error(w, "Member not found", http.StatusNotFound)
-		return
-	}
-
-	if lastAttendanceDate == nil || daysBetween(*lastAttendanceDate, todayFromDB) != 0 {
-		newStreak := 1
-
-		if lastAttendanceDate != nil &&
-			daysBetween(*lastAttendanceDate, todayFromDB) == 1 {
-			newStreak = currentStreak + 1
-		}
-
-		_, err = database.DB.Exec(
-			ctx,
-			`UPDATE users
-			 SET current_streak = $1,
-			     last_attendance_date = $2
-			 WHERE id = $3`,
-			newStreak,
-			todayDateString,
-			req.UserID,
-		)
-
-		if err != nil {
-			http.Error(w, "Could not update streak", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	_, err = database.DB.Exec(
-		ctx,
-		`
-		INSERT INTO attendance (user_id, attendance_date, arrival_time)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (user_id, attendance_date)
-		DO UPDATE SET arrival_time = EXCLUDED.arrival_time
-		`,
-		req.UserID,
-		todayDateString,
-		req.ArrivalTime,
-	)
-
-	if err != nil {
-		http.Error(w, "Could not mark attendance", http.StatusInternalServerError)
-		return
-	}
-
-	respondJSON(
-		w,
-		http.StatusOK,
-		map[string]string{"message": "Attendance marked"},
-	)
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "If that email is registered, a reset link has been sent.",
+	})
 }
 
-// ListMembersForAttendance powers the dedicated Attendance page.
-// Only active members are shown.
-func (h *AttendanceHandler) ListMembersForAttendance(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	shift := r.URL.Query().Get("shift")
-	batchID := r.URL.Query().Get("batch_id")
-
-	query := `
-		SELECT
-			u.id,
-			u.name,
-			b.name,
-			b.shift,
-			CASE
-				WHEN u.last_attendance_date >= CURRENT_DATE - INTERVAL '1 day'
-				THEN u.current_streak
-				ELSE 0
-			END,
-			a.arrival_time
-		FROM users u
-		LEFT JOIN batch_members bm ON bm.user_id = u.id
-		LEFT JOIN batches b ON b.id = bm.batch_id
-		LEFT JOIN attendance a
-			ON a.user_id = u.id
-			AND a.attendance_date = CURRENT_DATE
-		WHERE u.role = 'member'
-			AND u.is_active = TRUE
-	`
-
-	args := []interface{}{}
-	argPosition := 1
-
-	if shift != "" {
-		query += " AND b.shift = $" + strconv.Itoa(argPosition)
-		args = append(args, shift)
-		argPosition++
-	}
-
-	if batchID != "" {
-		query += " AND b.id = $" + strconv.Itoa(argPosition)
-		args = append(args, batchID)
-		argPosition++
-	}
-
-	query += " ORDER BY u.name ASC"
-
-	rows, err := database.DB.Query(
-		context.Background(),
-		query,
-		args...,
-	)
-
-	if err != nil {
-		http.Error(
-			w,
-			"Could not fetch members",
-			http.StatusInternalServerError,
-		)
+// ResetPassword validates the token (must exist, be unused, and not
+// expired) before allowing the password change.
+func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
+	var req models.ResetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 
-	defer rows.Close()
+	ctx := context.Background()
 
-	members := []models.AttendanceMemberItem{}
+	var userID int
+	err := database.DB.QueryRow(ctx, `
+		SELECT user_id FROM password_reset_tokens
+		WHERE token = $1 AND used = FALSE AND expires_at > NOW()
+	`, req.Token).Scan(&userID)
 
-	for rows.Next() {
-		var m models.AttendanceMemberItem
-
-		if err := rows.Scan(
-			&m.ID,
-			&m.Name,
-			&m.BatchName,
-			&m.Shift,
-			&m.CurrentStreak,
-			&m.TodayArrival,
-		); err != nil {
-			continue
-		}
-
-		members = append(members, m)
+	if err != nil {
+		http.Error(w, "This reset link is invalid or has expired", http.StatusBadRequest)
+		return
 	}
 
-	respondJSON(w, http.StatusOK, members)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "Could not process password", http.StatusInternalServerError)
+		return
+	}
+
+	database.DB.Exec(ctx, `UPDATE users SET password_hash = $1 WHERE id = $2`, string(hashedPassword), userID)
+	database.DB.Exec(ctx, `UPDATE password_reset_tokens SET used = TRUE WHERE token = $1`, req.Token)
+
+	respondJSON(w, http.StatusOK, map[string]string{"message": "Password reset successfully"})
+}
+// SendSignupOtp emails a 6-digit code to verify the address is real
+// and reachable before an account is ever created for it.
+func (h *AuthHandler) SendSignupOtp(w http.ResponseWriter, r *http.Request) {
+	var req models.SendSignupOtpRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Email == "" {
+		http.Error(w, "Email is required", http.StatusBadRequest)
+		return
+	}
+
+	ctx := context.Background()
+
+	var existingUserID int
+	err := database.DB.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, req.Email).Scan(&existingUserID)
+	if err == nil {
+		http.Error(w, "This email is already registered. Please log in instead.", http.StatusConflict)
+		return
+	}
+
+	otpCode := generateOtpCode()
+
+	_, err = database.DB.Exec(ctx, `
+		INSERT INTO signup_otps (email, otp_code, expires_at)
+		VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
+	`, req.Email, otpCode)
+	if err != nil {
+		http.Error(w, "Could not generate verification code", http.StatusInternalServerError)
+		return
+	}
+
+	if err := email.SendOtpEmail(req.Email, otpCode); err != nil {
+		log.Println("Failed to send OTP email:", err)
+		http.Error(w, "Could not send the verification email. Double-check the address and try again.", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"message": "Verification code sent"})
 }
 
-// AttendanceSummary returns a check-in count per day for roughly the
-// last N days — exactly the data the heatmap needs to color each cell.
-func (h *AttendanceHandler) AttendanceSummary(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	days := 91
-
-	if daysParam := r.URL.Query().Get("days"); daysParam != "" {
-		if parsed, err := strconv.Atoi(daysParam); err == nil {
-			days = parsed
-		}
-	}
-
-	rows, err := database.DB.Query(
-		context.Background(),
-		`
-		SELECT attendance_date, COUNT(*)
-		FROM attendance
-		WHERE attendance_date >= CURRENT_DATE - ($1 * INTERVAL '1 day')
-		GROUP BY attendance_date
-		ORDER BY attendance_date ASC
-		`,
-		days,
-	)
-
-	if err != nil {
-		http.Error(
-			w,
-			"Could not fetch attendance summary",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	defer rows.Close()
-
-	summary := []models.AttendanceDaySummary{}
-
-	for rows.Next() {
-		var entry models.AttendanceDaySummary
-		var date time.Time
-
-		if err := rows.Scan(&date, &entry.Count); err != nil {
-			continue
-		}
-
-		entry.Date = date.Format("2006-01-02")
-		summary = append(summary, entry)
-	}
-
-	respondJSON(w, http.StatusOK, summary)
-}
-
-// AttendanceForDate returns everyone who checked in on one specific
-// date. This intentionally includes inactive/removed members because
-// it is historical attendance data.
-func (h *AttendanceHandler) AttendanceForDate(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	date := chi.URLParam(r, "date")
-
-	rows, err := database.DB.Query(
-		context.Background(),
-		`
-		SELECT
-			u.id,
-			u.name,
-			u.email,
-			a.arrival_time
-		FROM attendance a
-		JOIN users u ON u.id = a.user_id
-		WHERE a.attendance_date = $1
-		ORDER BY a.arrival_time ASC
-		`,
-		date,
-	)
-
-	if err != nil {
-		http.Error(
-			w,
-			"Could not fetch attendance for date",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	defer rows.Close()
-
-	type DateAttendanceRow struct {
-		ID          int    `json:"id"`
-		Name        string `json:"name"`
-		Email       string `json:"email"`
-		ArrivalTime string `json:"arrival_time"`
-	}
-
-	records := []DateAttendanceRow{}
-
-	for rows.Next() {
-		var row DateAttendanceRow
-
-		if err := rows.Scan(
-			&row.ID,
-			&row.Name,
-			&row.Email,
-			&row.ArrivalTime,
-		); err != nil {
-			continue
-		}
-
-		records = append(records, row)
-	}
-
-	respondJSON(w, http.StatusOK, records)
-}
-
-// BatchSheet returns the printable attendance sheet for a batch.
-// Only active members are included.
-func (h *AttendanceHandler) BatchSheet(
-	w http.ResponseWriter,
-	r *http.Request,
-) {
-	batchID := chi.URLParam(r, "batchId")
-
-	date := r.URL.Query().Get("date")
-
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
-	}
-
-	rows, err := database.DB.Query(
-		context.Background(),
-		`
-		SELECT
-			u.id,
-			u.name,
-			u.email,
-			a.arrival_time
-		FROM users u
-		JOIN batch_members bm ON bm.user_id = u.id
-		LEFT JOIN attendance a
-			ON a.user_id = u.id
-			AND a.attendance_date = $2
-		WHERE bm.batch_id = $1
-			AND u.role = 'member'
-			AND u.is_active = TRUE
-		ORDER BY u.name ASC
-		`,
-		batchID,
-		date,
-	)
-
-	if err != nil {
-		http.Error(
-			w,
-			"Could not fetch batch sheet",
-			http.StatusInternalServerError,
-		)
-		return
-	}
-
-	defer rows.Close()
-
-	type SheetRow struct {
-		ID          int     `json:"id"`
-		Name        string  `json:"name"`
-		Email       string  `json:"email"`
-		ArrivalTime *string `json:"arrival_time"`
-	}
-
-	sheet := []SheetRow{}
-
-	for rows.Next() {
-		var row SheetRow
-
-		if err := rows.Scan(
-			&row.ID,
-			&row.Name,
-			&row.Email,
-			&row.ArrivalTime,
-		); err != nil {
-			continue
-		}
-
-		sheet = append(sheet, row)
-	}
-
-	respondJSON(w, http.StatusOK, sheet)
+// generateOtpCode produces a random 6-digit numeric code, always
+// zero-padded (e.g. "004821"), using crypto/rand for unpredictability.
+func generateOtpCode() string {
+	randomBytes := make([]byte, 4)
+	rand.Read(randomBytes)
+	number := binary.BigEndian.Uint32(randomBytes) % 1000000
+	return fmt.Sprintf("%06d", number)
 }
