@@ -91,24 +91,70 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	var req models.LoginRequest
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Email == "" || req.Password == "" {
+		http.Error(w, "Email and password are required", http.StatusBadRequest)
+		return
+	}
+
 	var user models.User
-var isActive bool
-err := database.DB.QueryRow(context.Background(),
-	`SELECT id, name, email, password_hash, role, created_at, is_active
-	 FROM users WHERE email = $1`,
-	req.Email,
-).Scan(&user.ID, &user.Name, &user.Email, &user.PasswordHash, &user.Role, &user.CreatedAt, &isActive)
+	var isActive bool
 
-if err != nil {
-	// Deliberately vague — don't reveal whether the email exists or not.
-	http.Error(w, "Invalid email or password", http.StatusUnauthorized)
-	return
-}
+	err := database.DB.QueryRow(
+		context.Background(),
+		`SELECT id, name, email, password_hash, role, created_at, is_active
+		 FROM users WHERE email = $1`,
+		req.Email,
+	).Scan(
+		&user.ID,
+		&user.Name,
+		&user.Email,
+		&user.PasswordHash,
+		&user.Role,
+		&user.CreatedAt,
+		&isActive,
+	)
 
-if !isActive {
-	http.Error(w, "This account has been deactivated. Please contact the gym.", http.StatusForbidden)
-	return
-}
+	if err != nil {
+		// Deliberately vague — don't reveal whether the email exists.
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	if !isActive {
+		http.Error(w, "This account has been deactivated. Please contact the gym.", http.StatusForbidden)
+		return
+	}
+
+	// Check password
+	if err := bcrypt.CompareHashAndPassword(
+		[]byte(user.PasswordHash),
+		[]byte(req.Password),
+	); err != nil {
+		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
+		return
+	}
+
+	// Generate JWT
+	token, err := auth.GenerateToken(user.ID, user.Role, h.JWTSecret)
+	if err != nil {
+		http.Error(w, "Could not generate session", http.StatusInternalServerError)
+		return
+	}
+
+	// Don't send password hash to frontend
+	user.PasswordHash = ""
+
+	respondJSON(w, http.StatusOK, models.AuthResponse{
+		Token: token,
+		User:  user,
+	})
 }
 
 func isDuplicateEmailError(err error) bool {
