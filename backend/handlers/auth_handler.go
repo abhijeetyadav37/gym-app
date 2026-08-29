@@ -3,18 +3,18 @@ package handlers
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"log"
+	"net/http"
+
 	"backend/auth"
 	"backend/database"
 	"backend/email"
 	appMiddleware "backend/middleware"
 	"backend/models"
-	
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -87,7 +87,10 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondJSON(w, http.StatusCreated, models.AuthResponse{Token: token, User: newUser})
+	respondJSON(w, http.StatusCreated, models.AuthResponse{
+		Token: token,
+		User:  newUser,
+	})
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +125,6 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
-		// Deliberately vague — don't reveal whether the email exists.
 		http.Error(w, "Invalid email or password", http.StatusUnauthorized)
 		return
 	}
@@ -158,7 +160,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 func isDuplicateEmailError(err error) bool {
-	return err != nil && (containsPgCode(err, "23505"))
+	return err != nil && containsPgCode(err, "23505")
 }
 
 // Me returns the currently logged-in user's basic info.
@@ -181,7 +183,6 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, user)
 }
 
-
 // ForgotPassword always returns the same success message whether or
 // not the email exists — this prevents someone from using this
 // endpoint to discover which emails are registered.
@@ -199,7 +200,14 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 	if err == nil {
 		tokenBytes := make([]byte, 32)
-		rand.Read(tokenBytes)
+		if _, err := rand.Read(tokenBytes); err != nil {
+			log.Println("Failed to generate password reset token:", err)
+			respondJSON(w, http.StatusOK, map[string]string{
+				"message": "If that email is registered, a reset link has been sent.",
+			})
+			return
+		}
+
 		token := hex.EncodeToString(tokenBytes)
 
 		database.DB.Exec(ctx, `
@@ -212,10 +220,10 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		// Sent in a goroutine so a slow email provider never delays
 		// the HTTP response back to the user.
 		go func() {
-	if err := email.SendPasswordResetEmail(req.Email, resetLink); err != nil {
-		log.Println("Failed to send password reset email:", err)
-	}
-}()
+			if err := email.SendPasswordResetEmail(req.Email, resetLink); err != nil {
+				log.Println("Failed to send password reset email:", err)
+			}
+		}()
 	}
 
 	respondJSON(w, http.StatusOK, map[string]string{
@@ -251,15 +259,27 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	database.DB.Exec(ctx, `UPDATE users SET password_hash = $1 WHERE id = $2`, string(hashedPassword), userID)
-	database.DB.Exec(ctx, `UPDATE password_reset_tokens SET used = TRUE WHERE token = $1`, req.Token)
+	database.DB.Exec(ctx,
+		`UPDATE users SET password_hash = $1 WHERE id = $2`,
+		string(hashedPassword),
+		userID,
+	)
 
-	respondJSON(w, http.StatusOK, map[string]string{"message": "Password reset successfully"})
+	database.DB.Exec(ctx,
+		`UPDATE password_reset_tokens SET used = TRUE WHERE token = $1`,
+		req.Token,
+	)
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "Password reset successfully",
+	})
 }
+
 // SendSignupOtp emails a 6-digit code to verify the address is real
 // and reachable before an account is ever created for it.
 func (h *AuthHandler) SendSignupOtp(w http.ResponseWriter, r *http.Request) {
 	var req models.SendSignupOtpRequest
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
@@ -273,9 +293,18 @@ func (h *AuthHandler) SendSignupOtp(w http.ResponseWriter, r *http.Request) {
 	ctx := context.Background()
 
 	var existingUserID int
-	err := database.DB.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, req.Email).Scan(&existingUserID)
+	err := database.DB.QueryRow(
+		ctx,
+		`SELECT id FROM users WHERE email = $1`,
+		req.Email,
+	).Scan(&existingUserID)
+
 	if err == nil {
-		http.Error(w, "This email is already registered. Please log in instead.", http.StatusConflict)
+		http.Error(
+			w,
+			"This email is already registered. Please log in instead.",
+			http.StatusConflict,
+		)
 		return
 	}
 
@@ -285,25 +314,39 @@ func (h *AuthHandler) SendSignupOtp(w http.ResponseWriter, r *http.Request) {
 		INSERT INTO signup_otps (email, otp_code, expires_at)
 		VALUES ($1, $2, NOW() + INTERVAL '10 minutes')
 	`, req.Email, otpCode)
+
 	if err != nil {
+		log.Println("Failed to save signup OTP:", err)
 		http.Error(w, "Could not generate verification code", http.StatusInternalServerError)
 		return
 	}
 
 	if err := email.SendOtpEmail(req.Email, otpCode); err != nil {
 		log.Println("Failed to send OTP email:", err)
-		http.Error(w, "Could not send the verification email. Double-check the address and try again.", http.StatusInternalServerError)
+		http.Error(
+			w,
+			"Could not send the verification email. Double-check the address and try again.",
+			http.StatusInternalServerError,
+		)
 		return
 	}
 
-	respondJSON(w, http.StatusOK, map[string]string{"message": "Verification code sent"})
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "Verification code sent",
+	})
 }
 
 // generateOtpCode produces a random 6-digit numeric code, always
 // zero-padded (e.g. "004821"), using crypto/rand for unpredictability.
 func generateOtpCode() string {
 	randomBytes := make([]byte, 4)
-	rand.Read(randomBytes)
+
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "000000"
+	}
+
 	number := binary.BigEndian.Uint32(randomBytes) % 1000000
+
 	return fmt.Sprintf("%06d", number)
 }
+
